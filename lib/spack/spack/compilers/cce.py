@@ -3,6 +3,8 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import os
+
 from spack.compiler import Compiler, UnsupportedCompilerFlag
 from spack.version import ver
 
@@ -15,47 +17,47 @@ class Cce(Compiler):
         # ``version_argument`` with the old value. Cannot be a property
         # as the new value is used in classmethods for path-based detection
         if not self.is_clang_based:
-            self.version_argument = '-V'
+            self.version_argument = "-V"
 
     # Subclasses use possible names of C compiler
-    cc_names = ['craycc', 'cc']
+    cc_names = ["craycc", "cc"]
 
     # Subclasses use possible names of C++ compiler
-    cxx_names = ['crayCC', 'CC']
+    cxx_names = ["crayCC", "CC"]
 
     # Subclasses use possible names of Fortran 77 compiler
-    f77_names = ['crayftn', 'ftn']
+    f77_names = ["crayftn", "ftn"]
 
     # Subclasses use possible names of Fortran 90 compiler
-    fc_names = ['crayftn', 'ftn']
+    fc_names = ["crayftn", "ftn"]
 
     # MacPorts builds gcc versions with prefixes and -mp-X.Y suffixes.
-    suffixes = [r'-mp-\d\.\d']
+    suffixes = [r"-mp-\d\.\d"]
 
-    PrgEnv = 'PrgEnv-cray'
-    PrgEnv_compiler = 'cce'
+    PrgEnv = "PrgEnv-cray"
+    PrgEnv_compiler = "cce"
 
     @property
     def link_paths(self):
         if self.PrgEnv in self.modules:
             # Old module-based interface to cray compilers
-            return {'cc': 'cce/cc',
-                    'cxx': 'cce/case-insensitive/CC',
-                    'f77': 'cce/ftn',
-                    'fc': 'cce/ftn'}
+            return {"cc": "cce/cc",
+                    "cxx": "cce/case-insensitive/CC",
+                    "f77": "cce/ftn",
+                    "fc": "cce/ftn"}
 
-        return {'cc': 'cce/craycc',
-                'cxx': 'cce/case-insensitive/crayCC',
-                'f77': 'cce/crayftn',
-                'fc': 'cce/crayftn'}
+        return {"cc": "cce/craycc",
+                "cxx": "cce/case-insensitive/crayCC",
+                "f77": "cce/crayftn",
+                "fc": "cce/crayftn"}
 
     @property
     def is_clang_based(self):
         version = self._real_version or self.version
-        return version >= ver('9.0') and 'classic' not in str(version)
+        return version >= ver("9.0") and "classic" not in str(version)
 
-    version_argument = '--version'
-    version_regex = r'[Vv]ersion.*?(\d+(\.\d+)+)'
+    version_argument = "--version"
+    version_regex = r"[Vv]ersion.*?(\d+(\.\d+)+)"
 
     @property
     def verbose_flag(self):
@@ -63,49 +65,43 @@ class Cce(Compiler):
 
     @property
     def debug_flags(self):
-        return ['-g', '-G0', '-G1', '-G2', '-Gfast']
+        return ["-g", "-G0", "-G1", "-G2", "-Gfast"]
 
     @property
     def openmp_flag(self):
         if self.is_clang_based:
-            return '-fopenmp'
+            return "-fopenmp"
         return "-h omp"
 
     @property
     def cxx11_flag(self):
         if self.is_clang_based:
-            return '-std=c++11'
+            return "-std=c++11"
         return "-h std=c++11"
 
     @property
     def cxx14_flag(self):
         if self.is_clang_based:
-            return '-std=c++14'
+            return "-std=c++14"
         return "-h std=c++14"
 
     @property
     def c99_flag(self):
         if self.is_clang_based:
-            return '-std=c99'
-        elif self.real_version >= ver('8.4'):
-            return '-h std=c99,noconform,gnu'
-        elif self.real_version >= ver('8.1'):
-            return '-h c99,noconform,gnu'
-        raise UnsupportedCompilerFlag(self,
-                                      'the C99 standard',
-                                      'c99_flag',
-                                      '< 8.1')
+            return "-std=c99"
+        elif self.real_version >= ver("8.4"):
+            return "-h std=c99,noconform,gnu"
+        elif self.real_version >= ver("8.1"):
+            return "-h c99,noconform,gnu"
+        raise UnsupportedCompilerFlag(self, "the C99 standard", "c99_flag", "< 8.1")
 
     @property
     def c11_flag(self):
         if self.is_clang_based:
-            return '-std=c11'
-        elif self.real_version >= ver('8.5'):
-            return '-h std=c11,noconform,gnu'
-        raise UnsupportedCompilerFlag(self,
-                                      'the C11 standard',
-                                      'c11_flag',
-                                      '< 8.5')
+            return "-std=c11"
+        elif self.real_version >= ver("8.5"):
+            return "-h std=c11,noconform,gnu"
+        raise UnsupportedCompilerFlag(self, "the C11 standard", "c11_flag", "< 8.5")
 
     @property
     def cc_pic_flag(self):
