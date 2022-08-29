@@ -1,23 +1,18 @@
-# Copyright 2013-2020 Lawrence Livermore National Security, LLC and other
+# Copyright 2013-2022 Lawrence Livermore National Security, LLC and other
 # Spack Project Developers. See the top-level COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-from spack import *
+
+from spack.package import *
 
 
-class Mrbench(Package):
+class Mrbench(MavenPackage):
     """A simple Java tool for SMTP server benchmarking."""
 
     homepage = "https://github.com/marcorosi/mrbench"
-    git      = "https://github.com/marcorosi/mrbench.git"
+    git = "https://github.com/marcorosi/mrbench.git"
 
-    version('master', branch='master')
+    version("master", branch="master")
 
-    depends_on('maven', type='build')
-    depends_on('java@8', type=('build', 'run'))
-
-    def install(self, spec, prefix):
-        mvn = which('mvn')
-        mvn('package', '-DskipTests')
-        install_tree('.', prefix)
+    depends_on("java@8", type=("build", "run"))

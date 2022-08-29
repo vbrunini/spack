@@ -1,8 +1,7 @@
-# Copyright 2013-2020 Lawrence Livermore National Security, LLC and other
+# Copyright 2013-2022 Lawrence Livermore National Security, LLC and other
 # Spack Project Developers. See the top-level COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-
 """This module implements Spack's configuration file handling.
 
 This implements Spack's configuration system, which handles merging
@@ -18,8 +17,8 @@ configuration system behaves.  The scopes are:
 And corresponding :ref:`per-platform scopes <platform-scopes>`. Important
 functions in this module are:
 
-* :py:func:`get_config`
-* :py:func:`update_config`
+* :func:`~spack.config.Configuration.get_config`
+* :func:`~spack.config.Configuration.update_config`
 
 ``get_config`` reads in YAML data for a particular scope and returns
 it. Callers can then modify the data and write it back with
@@ -29,96 +28,89 @@ When read in, Spack validates configurations with jsonschemas.  The
 schemas are in submodules of :py:mod:`spack.schema`.
 
 """
-
 import collections
+import contextlib
 import copy
+import functools
 import os
 import re
 import sys
-import multiprocessing
 from contextlib import contextmanager
-from six import iteritems
-from ordereddict_backport import OrderedDict
+from typing import List  # novm
 
 import ruamel.yaml as yaml
+import six
 from ruamel.yaml.error import MarkedYAMLError
+from six import iteritems
 
 import llnl.util.lang
 import llnl.util.tty as tty
-from llnl.util.filesystem import mkdirp
+from llnl.util.filesystem import mkdirp, rename
 
+import spack.compilers
 import spack.paths
-import spack.architecture
+import spack.platforms
 import spack.schema
+import spack.schema.bootstrap
 import spack.schema.compilers
-import spack.schema.mirrors
-import spack.schema.repos
-import spack.schema.packages
-import spack.schema.modules
+import spack.schema.concretizer
 import spack.schema.config
-import spack.schema.upstreams
 import spack.schema.env
-from spack.error import SpackError
+import spack.schema.mirrors
+import spack.schema.modules
+import spack.schema.packages
+import spack.schema.repos
+import spack.schema.upstreams
 
 # Hacked yaml for configuration files preserves line numbers.
 import spack.util.spack_yaml as syaml
+from spack.error import SpackError
+from spack.util.cpus import cpus_available
 
 #: Dict from section names -> schema for that section
 section_schemas = {
-    'compilers': spack.schema.compilers.schema,
-    'mirrors': spack.schema.mirrors.schema,
-    'repos': spack.schema.repos.schema,
-    'packages': spack.schema.packages.schema,
-    'modules': spack.schema.modules.schema,
-    'config': spack.schema.config.schema,
-    'upstreams': spack.schema.upstreams.schema,
+    "compilers": spack.schema.compilers.schema,
+    "concretizer": spack.schema.concretizer.schema,
+    "mirrors": spack.schema.mirrors.schema,
+    "repos": spack.schema.repos.schema,
+    "packages": spack.schema.packages.schema,
+    "modules": spack.schema.modules.schema,
+    "config": spack.schema.config.schema,
+    "upstreams": spack.schema.upstreams.schema,
+    "bootstrap": spack.schema.bootstrap.schema,
 }
 
 # Same as above, but including keys for environments
 # this allows us to unify config reading between configs and environments
 all_schemas = copy.deepcopy(section_schemas)
-all_schemas.update(dict((key, spack.schema.env.schema)
-                        for key in spack.schema.env.keys))
+all_schemas.update(dict((key, spack.schema.env.schema) for key in spack.schema.env.keys))
 
-#: Builtin paths to configuration files in Spack
-configuration_paths = (
-    # Default configuration scope is the lowest-level scope. These are
-    # versioned with Spack and can be overridden by systems, sites or users
-    ('defaults', os.path.join(spack.paths.etc_path, 'spack', 'defaults')),
-
-    # System configuration is per machine.
-    # No system-level configs should be checked into spack by default
-    ('system', os.path.join(spack.paths.system_etc_path, 'spack')),
-
-    # Site configuration is per spack instance, for sites or projects
-    # No site-level configs should be checked into spack by default.
-    ('site', os.path.join(spack.paths.etc_path, 'spack')),
-
-    # User configuration can override both spack defaults and site config
-    ('user', spack.paths.user_config_path)
-)
+#: Path to the default configuration
+configuration_defaults_path = ("defaults", os.path.join(spack.paths.etc_path, "defaults"))
 
 #: Hard-coded default values for some key configuration options.
 #: This ensures that Spack will still work even if config.yaml in
 #: the defaults scope is removed.
 config_defaults = {
-    'config': {
-        'debug': False,
-        'connect_timeout': 10,
-        'verify_ssl': True,
-        'checksum': True,
-        'dirty': False,
-        'build_jobs': min(16, multiprocessing.cpu_count()),
-        'build_stage': '$tempdir/spack-stage',
+    "config": {
+        "debug": False,
+        "connect_timeout": 10,
+        "verify_ssl": True,
+        "checksum": True,
+        "dirty": False,
+        "build_jobs": min(16, cpus_available()),
+        "build_stage": "$tempdir/spack-stage",
+        "concretizer": "clingo",
+        "license_dir": spack.paths.default_license_dir,
     }
 }
 
 #: metavar to use for commands that accept scopes
 #: this is shorter and more readable than listing all choices
-scopes_metavar = '{defaults,system,site,user}[/PLATFORM]'
+scopes_metavar = "{defaults,system,site,user}[/PLATFORM] or env:ENVIRONMENT"
 
 #: Base name for the (internal) overrides scope.
-overrides_base_name = 'overrides-'
+overrides_base_name = "overrides-"
 
 
 def first_existing(dictionary, keys):
@@ -126,20 +118,24 @@ def first_existing(dictionary, keys):
     try:
         return next(k for k in keys if k in dictionary)
     except StopIteration:
-        raise KeyError("None of %s is in dict!" % keys)
+        raise KeyError("None of %s is in dict!" % str(keys))
 
 
 class ConfigScope(object):
     """This class represents a configuration scope.
 
-       A scope is one directory containing named configuration files.
-       Each file is a config "section" (e.g., mirrors, compilers, etc).
+    A scope is one directory containing named configuration files.
+    Each file is a config "section" (e.g., mirrors, compilers, etc).
     """
 
     def __init__(self, name, path):
-        self.name = name           # scope name.
-        self.path = path           # path to directory containing configs.
+        self.name = name  # scope name.
+        self.path = path  # path to directory containing configs.
         self.sections = syaml.syaml_dict()  # sections read from config files.
+
+    @property
+    def is_platform_dependent(self):
+        return os.sep in self.name
 
     def get_section_filename(self, section):
         _validate_section_name(section)
@@ -147,13 +143,13 @@ class ConfigScope(object):
 
     def get_section(self, section):
         if section not in self.sections:
-            path   = self.get_section_filename(section)
+            path = self.get_section_filename(section)
             schema = section_schemas[section]
-            data   = read_config_file(path, schema)
+            data = read_config_file(path, schema)
             self.sections[section] = data
         return self.sections[section]
 
-    def write_section(self, section):
+    def _write_section(self, section):
         filename = self.get_section_filename(section)
         data = self.get_section(section)
 
@@ -163,38 +159,47 @@ class ConfigScope(object):
 
         try:
             mkdirp(self.path)
-            with open(filename, 'w') as f:
+            with open(filename, "w") as f:
                 syaml.dump_config(data, stream=f, default_flow_style=False)
         except (yaml.YAMLError, IOError) as e:
-            raise ConfigFileError(
-                "Error writing to config file: '%s'" % str(e))
+            raise ConfigFileError("Error writing to config file: '%s'" % str(e))
 
     def clear(self):
         """Empty cached config information."""
         self.sections = syaml.syaml_dict()
 
     def __repr__(self):
-        return '<ConfigScope: %s: %s>' % (self.name, self.path)
+        return "<ConfigScope: %s: %s>" % (self.name, self.path)
 
 
 class SingleFileScope(ConfigScope):
     """This class represents a configuration scope in a single YAML file."""
+
     def __init__(self, name, path, schema, yaml_path=None):
         """Similar to ``ConfigScope`` but can be embedded in another schema.
 
         Arguments:
             schema (dict): jsonschema for the file to read
-            yaml_path (list): list of dict keys in the schema where
-                config data can be found;
+            yaml_path (list): path in the schema where config data can be
+                found.
+                If the schema accepts the following yaml data, the yaml_path
+                would be ['outer', 'inner']
 
-        Elements of ``yaml_path`` can be tuples or lists to represent an
-        "or" of keys (e.g. "env" or "spack" is ``('env', 'spack')``)
+                .. code-block:: yaml
 
+                   outer:
+                     inner:
+                       config:
+                         install_tree: $spack/opt/spack
         """
         super(SingleFileScope, self).__init__(name, path)
         self._raw_data = None
         self.schema = schema
         self.yaml_path = yaml_path or []
+
+    @property
+    def is_platform_dependent(self):
+        return False
 
     def get_section_filename(self, section):
         return self.path
@@ -225,43 +230,72 @@ class SingleFileScope(ConfigScope):
         #      }
         #   }
         # }
+
+        # This bit ensures we have read the file and have
+        # the raw data in memory
         if self._raw_data is None:
             self._raw_data = read_config_file(self.path, self.schema)
             if self._raw_data is None:
                 return None
 
+        # Here we know we have the raw data and ensure we
+        # populate the sections dictionary, which may be
+        # cleared by the clear() method
+        if not self.sections:
+            section_data = self._raw_data
             for key in self.yaml_path:
-                if self._raw_data is None:
+                if section_data is None:
                     return None
+                section_data = section_data[key]
 
-                # support tuples as "or" in the yaml path
-                if isinstance(key, (list, tuple)):
-                    key = first_existing(self._raw_data, key)
-
-                self._raw_data = self._raw_data[key]
-
-            for section_key, data in self._raw_data.items():
+            for section_key, data in section_data.items():
                 self.sections[section_key] = {section_key: data}
 
         return self.sections.get(section, None)
 
-    def write_section(self, section):
-        validate(self.sections, self.schema)
+    def _write_section(self, section):
+        data_to_write = self._raw_data
+
+        # If there is no existing data, this section SingleFileScope has never
+        # been written to disk. We need to construct the portion of the data
+        # from the root of self._raw_data to the level at which the config
+        # sections are defined. That requires creating keys for every entry in
+        # self.yaml_path
+        if not data_to_write:
+            data_to_write = {}
+            # reverse because we construct it from the inside out
+            for key in reversed(self.yaml_path):
+                data_to_write = {key: data_to_write}
+
+        # data_update_pointer is a pointer to the part of data_to_write
+        # that we are currently updating.
+        # We start by traversing into the data to the point at which the
+        # config sections are defined. This means popping the keys from
+        # self.yaml_path
+        data_update_pointer = data_to_write
+        for key in self.yaml_path:
+            data_update_pointer = data_update_pointer[key]
+
+        # For each section, update the data at the level of our pointer
+        # with the data from the section
+        for key, data in self.sections.items():
+            data_update_pointer[key] = data[key]
+
+        validate(data_to_write, self.schema)
         try:
             parent = os.path.dirname(self.path)
             mkdirp(parent)
 
-            tmp = os.path.join(parent, '.%s.tmp' % self.path)
-            with open(tmp, 'w') as f:
-                syaml.dump_config(self.sections, stream=f,
-                                  default_flow_style=False)
-            os.path.move(tmp, self.path)
+            tmp = os.path.join(parent, ".%s.tmp" % os.path.basename(self.path))
+            with open(tmp, "w") as f:
+                syaml.dump_config(data_to_write, stream=f, default_flow_style=False)
+            rename(tmp, self.path)
+
         except (yaml.YAMLError, IOError) as e:
-            raise ConfigFileError(
-                "Error writing to config file: '%s'" % str(e))
+            raise ConfigFileError("Error writing to config file: '%s'" % str(e))
 
     def __repr__(self):
-        return '<SingleFileScope: %s: %s>' % (self.name, self.path)
+        return "<SingleFileScope: %s: %s>" % (self.name, self.path)
 
 
 class ImmutableConfigScope(ConfigScope):
@@ -270,11 +304,11 @@ class ImmutableConfigScope(ConfigScope):
     This is used for ConfigScopes passed on the command line.
     """
 
-    def write_section(self, section):
+    def _write_section(self, section):
         raise ConfigError("Cannot write to immutable scope %s" % self)
 
     def __repr__(self):
-        return '<ImmutableConfigScope: %s: %s>' % (self.name, self.path)
+        return "<ImmutableConfigScope: %s: %s>" % (self.name, self.path)
 
 
 class InternalConfigScope(ConfigScope):
@@ -284,6 +318,7 @@ class InternalConfigScope(ConfigScope):
     config file settings are accessed the same way, and Spack can easily
     override settings from files.
     """
+
     def __init__(self, name, data=None):
         super(InternalConfigScope, self).__init__(name, None)
         self.sections = syaml.syaml_dict()
@@ -293,12 +328,10 @@ class InternalConfigScope(ConfigScope):
             for section in data:
                 dsec = data[section]
                 validate({section: dsec}, section_schemas[section])
-                self.sections[section] = _mark_internal(
-                    syaml.syaml_dict({section: dsec}), name)
+                self.sections[section] = _mark_internal(syaml.syaml_dict({section: dsec}), name)
 
     def get_section_filename(self, section):
-        raise NotImplementedError(
-            "Cannot get filename for InternalConfigScope.")
+        raise NotImplementedError("Cannot get filename for InternalConfigScope.")
 
     def get_section(self, section):
         """Just reads from an internal dictionary."""
@@ -306,7 +339,7 @@ class InternalConfigScope(ConfigScope):
             self.sections[section] = None
         return self.sections[section]
 
-    def write_section(self, section):
+    def _write_section(self, section):
         """This only validates, as the data is already in memory."""
         data = self.get_section(section)
         if data is not None:
@@ -314,26 +347,43 @@ class InternalConfigScope(ConfigScope):
         self.sections[section] = _mark_internal(data, self.name)
 
     def __repr__(self):
-        return '<InternalConfigScope: %s>' % self.name
+        return "<InternalConfigScope: %s>" % self.name
+
+    def clear(self):
+        # no cache to clear here.
+        pass
 
     @staticmethod
     def _process_dict_keyname_overrides(data):
         """Turn a trailing `:' in a key name into an override attribute."""
         result = {}
         for sk, sv in iteritems(data):
-            if sk.endswith(':'):
+            if sk.endswith(":"):
                 key = syaml.syaml_str(sk[:-1])
                 key.override = True
             else:
                 key = sk
 
             if isinstance(sv, dict):
-                result[key]\
-                    = InternalConfigScope._process_dict_keyname_overrides(sv)
+                result[key] = InternalConfigScope._process_dict_keyname_overrides(sv)
             else:
                 result[key] = copy.copy(sv)
 
         return result
+
+
+def _config_mutator(method):
+    """Decorator to mark all the methods in the Configuration class
+    that mutate the underlying configuration. Used to clear the
+    memoization cache.
+    """
+
+    @functools.wraps(method)
+    def _method(self, *args, **kwargs):
+        self._get_config_memoized.cache.clear()
+        return method(self, *args, **kwargs)
+
+    return _method
 
 
 class Configuration(object):
@@ -350,37 +400,45 @@ class Configuration(object):
                 Configuration, ordered from lowest to highest precedence
 
         """
-        self.scopes = OrderedDict()
+        self.scopes = collections.OrderedDict()
         for scope in scopes:
             self.push_scope(scope)
         self.format_updates = collections.defaultdict(list)
 
+    @_config_mutator
     def push_scope(self, scope):
         """Add a higher precedence scope to the Configuration."""
         cmd_line_scope = None
         if self.scopes:
             highest_precedence_scope = list(self.scopes.values())[-1]
-            if highest_precedence_scope.name == 'command_line':
+            if highest_precedence_scope.name == "command_line":
                 # If the command-line scope is present, it should always
                 # be the scope of highest precedence
                 cmd_line_scope = self.pop_scope()
 
         self.scopes[scope.name] = scope
         if cmd_line_scope:
-            self.scopes['command_line'] = cmd_line_scope
+            self.scopes["command_line"] = cmd_line_scope
 
+    @_config_mutator
     def pop_scope(self):
         """Remove the highest precedence scope and return it."""
         name, scope = self.scopes.popitem(last=True)
         return scope
 
+    @_config_mutator
     def remove_scope(self, scope_name):
-        return self.scopes.pop(scope_name)
+        """Remove scope by name; has no effect when ``scope_name`` does not exist"""
+        return self.scopes.pop(scope_name, None)
 
     @property
     def file_scopes(self):
         """List of writable scopes with an associated file."""
-        return [s for s in self.scopes.values() if type(s) == ConfigScope]
+        return [
+            s
+            for s in self.scopes.values()
+            if (type(s) == ConfigScope or type(s) == SingleFileScope)
+        ]
 
     def highest_precedence_scope(self):
         """Non-internal scope with highest precedence."""
@@ -392,7 +450,7 @@ class Configuration(object):
         Platform-specific scopes are of the form scope/platform"""
         generator = reversed(self.file_scopes)
         highest = next(generator, None)
-        while highest and '/' in highest.name:
+        while highest and highest.is_platform_dependent:
             highest = next(generator, None)
         return highest
 
@@ -426,15 +484,16 @@ class Configuration(object):
             return self.scopes[scope]
 
         else:
-            raise ValueError("Invalid config scope: '%s'.  Must be one of %s"
-                             % (scope, self.scopes.keys()))
+            raise ValueError(
+                "Invalid config scope: '%s'.  Must be one of %s" % (scope, self.scopes.keys())
+            )
 
     def get_config_filename(self, scope, section):
-        """For some scope and section, get the name of the configuration file.
-        """
+        """For some scope and section, get the name of the configuration file."""
         scope = self._validate_scope(scope)
         return scope.get_section_filename(section)
 
+    @_config_mutator
     def clear_caches(self):
         """Clears the caches for configuration files,
 
@@ -442,6 +501,7 @@ class Configuration(object):
         for scope in self.scopes.values():
             scope.clear()
 
+    @_config_mutator
     def update_config(self, section, update_data, scope=None, force=False):
         """Update the configuration file for a particular scope.
 
@@ -462,12 +522,14 @@ class Configuration(object):
             force (str): force the update
         """
         if self.format_updates.get(section) and not force:
-            msg = ('The "{0}" section of the configuration needs to be written'
-                   ' to disk, but is currently using a deprecated format. '
-                   'Please update it using:\n\n'
-                   '\tspack config [--scope=<scope] update {0}\n\n'
-                   'Note that previous versions of Spack will not be able to '
-                   'use the updated configuration.')
+            msg = (
+                'The "{0}" section of the configuration needs to be written'
+                " to disk, but is currently using a deprecated format. "
+                "Please update it using:\n\n"
+                "\tspack config [--scope=<scope>] update {0}\n\n"
+                "Note that previous versions of Spack will not be able to "
+                "use the updated configuration."
+            )
             msg = msg.format(section)
             raise RuntimeError(msg)
 
@@ -475,46 +537,48 @@ class Configuration(object):
         scope = self._validate_scope(scope)  # get ConfigScope object
 
         # manually preserve comments
-        need_comment_copy = (section in scope.sections and
-                             scope.sections[section] is not None)
+        need_comment_copy = section in scope.sections and scope.sections[section] is not None
         if need_comment_copy:
-            comments = getattr(scope.sections[section][section],
-                               yaml.comments.Comment.attrib,
-                               None)
+            comments = getattr(
+                scope.sections[section][section], yaml.comments.Comment.attrib, None
+            )
 
         # read only the requested section's data.
         scope.sections[section] = syaml.syaml_dict({section: update_data})
         if need_comment_copy and comments:
-            setattr(scope.sections[section][section],
-                    yaml.comments.Comment.attrib,
-                    comments)
+            setattr(scope.sections[section][section], yaml.comments.Comment.attrib, comments)
 
-        scope.write_section(section)
+        scope._write_section(section)
 
     def get_config(self, section, scope=None):
         """Get configuration settings for a section.
 
         If ``scope`` is ``None`` or not provided, return the merged contents
         of all of Spack's configuration scopes.  If ``scope`` is provided,
-        return only the confiugration as specified in that scope.
+        return only the configuration as specified in that scope.
 
         This off the top-level name from the YAML section.  That is, for a
         YAML config file that looks like this::
 
            config:
-             install_tree: $spack/opt/spack
-             module_roots:
-               lmod:   $spack/share/spack/lmod
+             install_tree:
+               root: $spack/opt/spack
+             build_stage:
+             - $tmpdir/$user/spack-stage
 
         ``get_config('config')`` will return::
 
-           { 'install_tree': '$spack/opt/spack',
-             'module_roots: {
-                 'lmod': '$spack/share/spack/lmod'
+           { 'install_tree': {
+                 'root': '$spack/opt/spack',
              }
+             'build_stage': ['$tmpdir/$user/spack-stage']
            }
 
         """
+        return self._get_config_memoized(section, scope)
+
+    @llnl.util.lang.memoized
+    def _get_config_memoized(self, section, scope):
         _validate_section_name(section)
 
         if scope is None:
@@ -540,9 +604,6 @@ class Configuration(object):
             changed = _update_in_memory(data, section)
             if changed:
                 self.format_updates[section].append(scope)
-                msg = ('OUTDATED CONFIGURATION FILE '
-                       '[section={0}, scope={1}, dir={2}]')
-                tty.debug(msg.format(section, scope.name, scope.path))
 
             merged_section = merge_yaml(merged_section, data)
 
@@ -569,7 +630,7 @@ class Configuration(object):
             spack.config.get('config:dirty')
 
         We use ``:`` as the separator, like YAML objects.
-    """
+        """
         # TODO: Currently only handles maps. Think about lists if needed.
         parts = process_config_path(path)
         section = parts.pop(0)
@@ -578,16 +639,21 @@ class Configuration(object):
 
         while parts:
             key = parts.pop(0)
-            value = value.get(key, default)
+            # cannot use value.get(key, default) in case there is another part
+            # and default is not a dict
+            if key not in value:
+                return default
+            value = value[key]
 
         return value
 
+    @_config_mutator
     def set(self, path, value, scope=None):
         """Convenience function for setting single values in config files.
 
         Accepts the path syntax described in ``get()``.
         """
-        if ':' not in path:
+        if ":" not in path:
             # handle bare section name as path
             self.update_config(path, value, scope=scope)
             return
@@ -632,8 +698,7 @@ class Configuration(object):
         try:
             data = syaml.syaml_dict()
             data[section] = self.get_config(section)
-            syaml.dump_config(
-                data, stream=sys.stdout, default_flow_style=False, blame=blame)
+            syaml.dump_config(data, stream=sys.stdout, default_flow_style=False, blame=blame)
         except (yaml.YAMLError, IOError):
             raise ConfigError("Error reading configuration: %s" % section)
 
@@ -644,7 +709,7 @@ def override(path_or_scope, value=None):
 
     Arguments:
         path_or_scope (ConfigScope or str): scope or single option to override
-        value (object, optional): value for the single option
+        value (object or None): value for the single option
 
     Temporarily push a scope on the current configuration, then remove it
     after the context completes. If a single option is provided, create
@@ -657,11 +722,10 @@ def override(path_or_scope, value=None):
     else:
         base_name = overrides_base_name
         # Ensure the new override gets a unique scope name
-        current_overrides = [s.name for s in
-                             config.matching_scopes(r'^{0}'.format(base_name))]
+        current_overrides = [s.name for s in config.matching_scopes(r"^{0}".format(base_name))]
         num_overrides = len(current_overrides)
         while True:
-            scope_name = '{0}{1}'.format(base_name, num_overrides)
+            scope_name = "{0}{1}".format(base_name, num_overrides)
             if scope_name in current_overrides:
                 num_overrides += 1
             else:
@@ -671,21 +735,22 @@ def override(path_or_scope, value=None):
         config.push_scope(overrides)
         config.set(path_or_scope, value, scope=scope_name)
 
-    yield config
-
-    scope = config.remove_scope(overrides.name)
-    assert scope is overrides
+    try:
+        yield config
+    finally:
+        scope = config.remove_scope(overrides.name)
+        assert scope is overrides
 
 
 #: configuration scopes added on the command line
 #: set by ``spack.main.main()``.
-command_line_scopes = []
+command_line_scopes = []  # type: List[str]
 
 
 def _add_platform_scope(cfg, scope_type, name, path):
     """Add a platform-specific subdirectory for the current platform."""
-    platform = spack.architecture.platform().name
-    plat_name = '%s/%s' % (name, platform)
+    platform = spack.platforms.host().name
+    plat_name = os.path.join(name, platform)
     plat_path = os.path.join(path, platform)
     cfg.push_scope(scope_type(plat_name, plat_path))
 
@@ -704,7 +769,7 @@ def _add_command_line_scopes(cfg, command_line_scopes):
             raise ConfigError("config scope is not readable: '%s'" % path)
 
         # name based on order on the command line
-        name = 'cmd_scope_%d' % i
+        name = "cmd_scope_%d" % i
         cfg.push_scope(ImmutableConfigScope(name, path))
         _add_platform_scope(cfg, ImmutableConfigScope, name, path)
 
@@ -723,8 +788,35 @@ def _config():
     cfg = Configuration()
 
     # first do the builtin, hardcoded defaults
-    defaults = InternalConfigScope('_builtin', config_defaults)
-    cfg.push_scope(defaults)
+    builtin = InternalConfigScope("_builtin", config_defaults)
+    cfg.push_scope(builtin)
+
+    # Builtin paths to configuration files in Spack
+    configuration_paths = [
+        # Default configuration scope is the lowest-level scope. These are
+        # versioned with Spack and can be overridden by systems, sites or users
+        configuration_defaults_path,
+    ]
+
+    disable_local_config = "SPACK_DISABLE_LOCAL_CONFIG" in os.environ
+
+    # System configuration is per machine.
+    # This is disabled if user asks for no local configuration.
+    if not disable_local_config:
+        configuration_paths.append(
+            ("system", spack.paths.system_config_path),
+        )
+
+    # Site configuration is per spack instance, for sites or projects
+    # No site-level configs should be checked into spack by default.
+    configuration_paths.append(
+        ("site", os.path.join(spack.paths.etc_path)),
+    )
+
+    # User configuration can override both spack defaults and site config
+    # This is disabled if user asks for no local configuration.
+    if not disable_local_config:
+        configuration_paths.append(("user", spack.paths.user_config_path))
 
     # add each scope and its platform-specific directory
     for name, path in configuration_paths:
@@ -738,13 +830,87 @@ def _config():
 
     # we make a special scope for spack commands so that they can
     # override configuration options.
-    cfg.push_scope(InternalConfigScope('command_line'))
+    cfg.push_scope(InternalConfigScope("command_line"))
 
     return cfg
 
 
 #: This is the singleton configuration instance for Spack.
 config = llnl.util.lang.Singleton(_config)
+
+
+def add_from_file(filename, scope=None):
+    """Add updates to a config from a filename"""
+    import spack.environment as ev
+
+    # Get file as config dict
+    data = read_config_file(filename)
+    if any(k in data for k in spack.schema.env.keys):
+        data = ev.config_dict(data)
+
+    # update all sections from config dict
+    # We have to iterate on keys to keep overrides from the file
+    for section in data.keys():
+        if section in section_schemas.keys():
+            # Special handling for compiler scope difference
+            # Has to be handled after we choose a section
+            if scope is None:
+                scope = default_modify_scope(section)
+
+            value = data[section]
+            existing = get(section, scope=scope)
+            new = merge_yaml(existing, value)
+
+            # We cannot call config.set directly (set is a type)
+            config.set(section, new, scope)
+
+
+def add(fullpath, scope=None):
+    """Add the given configuration to the specified config scope.
+    Add accepts a path. If you want to add from a filename, use add_from_file"""
+
+    components = process_config_path(fullpath)
+
+    has_existing_value = True
+    path = ""
+    override = False
+    for idx, name in enumerate(components[:-1]):
+        # First handle double colons in constructing path
+        colon = "::" if override else ":" if path else ""
+        path += colon + name
+        if getattr(name, "override", False):
+            override = True
+        else:
+            override = False
+
+        # Test whether there is an existing value at this level
+        existing = get(path, scope=scope)
+
+        if existing is None:
+            has_existing_value = False
+            # We've nested further than existing config, so we need the
+            # type information for validation to know how to handle bare
+            # values appended to lists.
+            existing = get_valid_type(path)
+
+            # construct value from this point down
+            value = syaml.load_config(components[-1])
+            for component in reversed(components[idx + 1 : -1]):
+                value = {component: value}
+            break
+
+    if has_existing_value:
+        path, _, value = fullpath.rpartition(":")
+        value = syaml.load_config(value)
+        existing = get(path, scope=scope)
+
+    # append values to lists
+    if isinstance(existing, list) and not isinstance(value, list):
+        value = [value]
+
+    # merge value into existing
+    new = merge_yaml(existing, value)
+    config.set(path, new, scope)
 
 
 def get(path, default=None, scope=None):
@@ -760,6 +926,12 @@ def set(path, value, scope=None):
     return config.set(path, value, scope)
 
 
+def add_default_platform_scope(platform):
+    plat_name = os.path.join("defaults", platform)
+    plat_path = os.path.join(configuration_defaults_path[1], platform)
+    config.push_scope(ConfigScope(plat_name, plat_path))
+
+
 def scopes():
     """Convenience function to get list of configuration scopes."""
     return config.scopes
@@ -770,7 +942,8 @@ def _validate_section_name(section):
     if section not in section_schemas:
         raise ConfigSectionError(
             "Invalid config section: '%s'. Options are: %s"
-            % (section, " ".join(section_schemas.keys())))
+            % (section, " ".join(section_schemas.keys()))
+        )
 
 
 def validate(data, schema, filename=None):
@@ -784,6 +957,7 @@ def validate(data, schema, filename=None):
     on Spack YAML structures.
     """
     import jsonschema
+
     # validate a copy to avoid adding defaults
     # This allows us to round-trip data without adding to it.
     test_data = copy.deepcopy(data)
@@ -791,20 +965,20 @@ def validate(data, schema, filename=None):
     if isinstance(test_data, yaml.comments.CommentedMap):
         # HACK to fully copy ruamel CommentedMap that doesn't provide copy
         # method. Especially necessary for environments
-        setattr(test_data,
-                yaml.comments.Comment.attrib,
-                getattr(data,
-                        yaml.comments.Comment.attrib,
-                        yaml.comments.Comment()))
+        setattr(
+            test_data,
+            yaml.comments.Comment.attrib,
+            getattr(data, yaml.comments.Comment.attrib, yaml.comments.Comment()),
+        )
 
     try:
         spack.schema.Validator(schema).validate(test_data)
     except jsonschema.ValidationError as e:
-        if hasattr(e.instance, 'lc'):
+        if hasattr(e.instance, "lc"):
             line_number = e.instance.lc.line + 1
         else:
             line_number = None
-        raise ConfigFormatError(e, data, filename, line_number)
+        raise six.raise_from(ConfigFormatError(e, data, filename, line_number), e)
     # return the validated data so that we can access the raw data
     # mostly relevant for environments
     return test_data
@@ -825,8 +999,7 @@ def read_config_file(filename, schema=None):
         return None
 
     elif not os.path.isfile(filename):
-        raise ConfigFileError(
-            "Invalid configuration. %s exists but is not a file." % filename)
+        raise ConfigFileError("Invalid configuration. %s exists but is not a file." % filename)
 
     elif not os.access(filename, os.R_OK):
         raise ConfigFileError("Config file is not readable: %s" % filename)
@@ -844,16 +1017,21 @@ def read_config_file(filename, schema=None):
         return data
 
     except StopIteration:
-        raise ConfigFileError(
-            "Config file is empty or is not a valid YAML dict: %s" % filename)
+        raise ConfigFileError("Config file is empty or is not a valid YAML dict: %s" % filename)
 
     except MarkedYAMLError as e:
-        raise ConfigFileError(
-            "Error parsing yaml%s: %s" % (str(e.context_mark), e.problem))
+        msg = "Error parsing yaml"
+        mark = e.context_mark if e.context_mark else e.problem_mark
+        if mark:
+            line, column = mark.line, mark.column
+            msg += ": near %s, %s, %s" % (mark.name, str(line), str(column))
+        else:
+            msg += ": %s" % (filename)
+        msg += ": %s" % (e.problem)
+        raise ConfigFileError(msg)
 
     except IOError as e:
-        raise ConfigFileError(
-            "Error reading configuration file %s: %s" % (filename, str(e)))
+        raise ConfigFileError("Error reading configuration file %s: %s" % (filename, str(e)))
 
 
 def _override(string):
@@ -864,7 +1042,7 @@ def _override(string):
     configs instead of merging into them.
 
     """
-    return hasattr(string, 'override') and string.override
+    return hasattr(string, "override") and string.override
 
 
 def _mark_internal(data, name):
@@ -873,8 +1051,9 @@ def _mark_internal(data, name):
     This is used by `spack config blame` to show where config lines came from.
     """
     if isinstance(data, dict):
-        d = syaml.syaml_dict((_mark_internal(k, name), _mark_internal(v, name))
-                             for k, v in data.items())
+        d = syaml.syaml_dict(
+            (_mark_internal(k, name), _mark_internal(v, name)) for k, v in data.items()
+        )
     elif isinstance(data, list):
         d = syaml.syaml_list(_mark_internal(e, name) for e in data)
     else:
@@ -895,22 +1074,36 @@ def get_valid_type(path):
     path given, the priority order is ``list``, ``dict``, ``str``, ``bool``,
     ``int``, ``float``.
     """
+    types = {
+        "array": list,
+        "object": syaml.syaml_dict,
+        "string": str,
+        "boolean": bool,
+        "integer": int,
+        "number": float,
+    }
+
     components = process_config_path(path)
     section = components[0]
-    for type in (list, syaml.syaml_dict, str, bool, int, float):
-        try:
-            ret = type()
-            test_data = ret
-            for component in reversed(components):
-                test_data = {component: test_data}
-            validate(test_data, section_schemas[section])
-            return ret
-        except (ConfigFormatError, AttributeError):
-            # This type won't validate, try the next one
-            # Except AttributeError because undefined behavior of dict ordering
-            # in python 3.5 can cause the validator to raise an AttributeError
-            # instead of a ConfigFormatError.
-            pass
+
+    # Use None to construct the test data
+    test_data = None
+    for component in reversed(components):
+        test_data = {component: test_data}
+
+    try:
+        validate(test_data, section_schemas[section])
+    except (ConfigFormatError, AttributeError) as e:
+        jsonschema_error = e.validation_error
+        if jsonschema_error.validator == "type":
+            return types[jsonschema_error.validator_value]()
+        elif jsonschema_error.validator in ("anyOf", "oneOf"):
+            for subschema in jsonschema_error.validator_value:
+                schema_type = subschema.get("type")
+                if schema_type is not None:
+                    return types[schema_type]()
+    else:
+        return type(None)
     raise ConfigError("Cannot determine valid type for path '%s'." % path)
 
 
@@ -922,10 +1115,16 @@ def merge_yaml(dest, source):
 
        dest = merge_yaml(dest, source)
 
+    In the result, elements from lists from ``source`` will appear before
+    elements of lists from ``dest``. Likewise, when iterating over keys
+    or items in merged ``OrderedDict`` objects, keys from ``source`` will
+    appear before keys from ``dest``.
+
     Config file authors can optionally end any attribute in a dict
     with `::` instead of `:`, and the key will override that of the
     parent instead of merging.
     """
+
     def they_are(t):
         return isinstance(dest, t) and isinstance(source, t)
 
@@ -941,34 +1140,26 @@ def merge_yaml(dest, source):
 
     # Source dict is merged into dest.
     elif they_are(dict):
-        # track keys for marking
-        key_marks = {}
+        # save dest keys to reinsert later -- this ensures that  source items
+        # come *before* dest in OrderdDicts
+        dest_keys = [dk for dk in dest.keys() if dk not in source]
 
         for sk, sv in iteritems(source):
-            if _override(sk) or sk not in dest:
-                # if sk ended with ::, or if it's new, completely override
-                dest[sk] = copy.copy(sv)
-                # copy ruamel comments manually
+            # always remove the dest items. Python dicts do not overwrite
+            # keys on insert, so this ensures that source keys are copied
+            # into dest along with mark provenance (i.e., file/line info).
+            merge = sk in dest
+            old_dest_value = dest.pop(sk, None)
+
+            if merge and not _override(sk):
+                dest[sk] = merge_yaml(old_dest_value, sv)
             else:
-                # otherwise, merge the YAML
-                dest[sk] = merge_yaml(dest[sk], source[sk])
+                # if sk ended with ::, or if it's new, completely override
+                dest[sk] = copy.deepcopy(sv)
 
-            # this seems unintuitive, but see below. We need this because
-            # Python dicts do not overwrite keys on insert, and we want
-            # to copy mark information on source keys to dest.
-            key_marks[sk] = sk
-
-        # ensure that keys are marked in the destination. The
-        # key_marks dict ensures we can get the actual source key
-        # objects from dest keys
-        for dk in list(dest.keys()):
-            if dk in key_marks and syaml.markable(dk):
-                syaml.mark(dk, key_marks[dk])
-            elif dk in key_marks:
-                # The destination key may not be markable if it was derived
-                # from a schema default. In this case replace the key.
-                val = dest.pop(dk)
-                dest[key_marks[dk]] = val
+        # reinsert dest keys so they are last in the result
+        for dk in dest_keys:
+            dest[dk] = dest.pop(dk)
 
         return dest
 
@@ -983,18 +1174,17 @@ def merge_yaml(dest, source):
 #
 def process_config_path(path):
     result = []
-    if path.startswith(':'):
-        raise syaml.SpackYAMLError("Illegal leading `:' in path `{0}'".
-                                   format(path), '')
+    if path.startswith(":"):
+        raise syaml.SpackYAMLError("Illegal leading `:' in path `{0}'".format(path), "")
     seen_override_in_path = False
     while path:
-        front, sep, path = path.partition(':')
-        if (sep and not path) or path.startswith(':'):
+        front, sep, path = path.partition(":")
+        if (sep and not path) or path.startswith(":"):
             if seen_override_in_path:
-                raise syaml.SpackYAMLError("Meaningless second override"
-                                           " indicator `::' in path `{0}'".
-                                           format(path), '')
-            path = path.lstrip(':')
+                raise syaml.SpackYAMLError(
+                    "Meaningless second override" " indicator `::' in path `{0}'".format(path), ""
+                )
+            path = path.lstrip(":")
             front = syaml.syaml_str(front)
             front.override = True
             seen_override_in_path = True
@@ -1005,17 +1195,17 @@ def process_config_path(path):
 #
 # Settings for commands that modify configuration
 #
-def default_modify_scope(section='config'):
+def default_modify_scope(section="config"):
     """Return the config scope that commands should modify by default.
 
     Commands that modify configuration by default modify the *highest*
     priority scope.
 
     Arguments:
-        section (boolean): Section for which to get the default scope.
+        section (bool): Section for which to get the default scope.
             If this is not 'compilers', a general (non-platform) scope is used.
     """
-    if section == 'compilers':
+    if section == "compilers":
         return spack.config.config.highest_precedence_scope().name
     else:
         return spack.config.config.highest_precedence_non_platform_scope().name
@@ -1060,8 +1250,58 @@ def ensure_latest_format_fn(section):
     # The line below is based on the fact that every module we need
     # is already imported at the top level
     section_module = getattr(spack.schema, section)
-    update_fn = getattr(section_module, 'update', lambda x: False)
+    update_fn = getattr(section_module, "update", lambda x: False)
     return update_fn
+
+
+@contextlib.contextmanager
+def use_configuration(*scopes_or_paths):
+    """Use the configuration scopes passed as arguments within the
+    context manager.
+
+    Args:
+        *scopes_or_paths: scope objects or paths to be used
+
+    Returns:
+        Configuration object associated with the scopes passed as arguments
+    """
+    global config
+
+    # Normalize input and construct a Configuration object
+    configuration = _config_from(scopes_or_paths)
+    config.clear_caches(), configuration.clear_caches()
+
+    # Save and clear the current compiler cache
+    saved_compiler_cache = spack.compilers._cache_config_file
+    spack.compilers._cache_config_file = []
+
+    saved_config, config = config, configuration
+
+    try:
+        yield configuration
+    finally:
+        # Restore previous config files
+        spack.compilers._cache_config_file = saved_compiler_cache
+        config = saved_config
+
+
+@llnl.util.lang.memoized
+def _config_from(scopes_or_paths):
+    scopes = []
+    for scope_or_path in scopes_or_paths:
+        # If we have a config scope we are already done
+        if isinstance(scope_or_path, ConfigScope):
+            scopes.append(scope_or_path)
+            continue
+
+        # Otherwise we need to construct it
+        path = os.path.normpath(scope_or_path)
+        assert os.path.isdir(path), '"{0}" must be a directory'.format(path)
+        name = os.path.basename(path)
+        scopes.append(ConfigScope(name, path))
+
+    configuration = Configuration(*scopes)
+    return configuration
 
 
 class ConfigError(SpackError):
@@ -1082,6 +1322,7 @@ class ConfigFormatError(ConfigError):
     def __init__(self, validation_error, data, filename=None, line=None):
         # spack yaml has its own file/line marks -- try to find them
         # we prioritize these over the inputs
+        self.validation_error = validation_error
         mark = self._get_mark(validation_error, data)
         if mark:
             filename = mark.name
@@ -1090,21 +1331,21 @@ class ConfigFormatError(ConfigError):
         self.filename = filename  # record this for ruamel.yaml
 
         # construct location
-        location = '<unknown file>'
+        location = "<unknown file>"
         if filename:
-            location = '%s' % filename
+            location = "%s" % filename
         if line is not None:
-            location += ':%d' % line
+            location += ":%d" % line
 
-        message = '%s: %s' % (location, validation_error.message)
+        message = "%s: %s" % (location, validation_error.message)
         super(ConfigError, self).__init__(message)
 
     def _get_mark(self, validation_error, data):
-        """Get the file/line mark fo a validation error from a Spack YAML file.
-        """
+        """Get the file/line mark fo a validation error from a Spack YAML file."""
+
         def _get_mark_or_first_member_mark(obj):
             # mark of object itelf
-            mark = getattr(obj, '_start_mark', None)
+            mark = getattr(obj, "_start_mark", None)
             if mark:
                 return mark
 
@@ -1112,7 +1353,7 @@ class ConfigFormatError(ConfigError):
             if isinstance(obj, (list, dict)):
                 first_member = next(iter(obj), None)
                 if first_member:
-                    mark = getattr(first_member, '_start_mark', None)
+                    mark = getattr(first_member, "_start_mark", None)
                     if mark:
                         return mark
 
@@ -1140,7 +1381,7 @@ class ConfigFormatError(ConfigError):
                 elif isinstance(parent, list):
                     keylist = parent
                 idx = keylist.index(path[-1])
-                mark = getattr(keylist[idx], '_start_mark', None)
+                mark = getattr(keylist[idx], "_start_mark", None)
                 if mark:
                     return mark
 

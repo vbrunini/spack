@@ -1,9 +1,9 @@
-# Copyright 2013-2020 Lawrence Livermore National Security, LLC and other
+# Copyright 2013-2022 Lawrence Livermore National Security, LLC and other
 # Spack Project Developers. See the top-level COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-from spack import *
+from spack.package import *
 
 
 class PyPyopenssl(PythonPackage):
@@ -15,10 +15,10 @@ class PyPyopenssl(PythonPackage):
     drop your pyOpenSSL dependency."""
 
     homepage = "https://pyopenssl.org/"
-    url      = "https://pypi.io/packages/source/p/pyOpenSSL/pyOpenSSL-19.0.0.tar.gz"
+    pypi = "pyOpenSSL/pyOpenSSL-19.0.0.tar.gz"
 
-    version('19.0.0', sha256='aeca66338f6de19d1aa46ed634c3b9ae519a64b458f8468aec688e7e3c20f200')
+    version("19.0.0", sha256="aeca66338f6de19d1aa46ed634c3b9ae519a64b458f8468aec688e7e3c20f200")
 
-    depends_on('py-setuptools', type='build')
-    depends_on('py-cryptography@2.3:', type=('build', 'run'))
-    depends_on('py-six@1.5.2:', type=('build', 'run'))
+    depends_on("py-setuptools", type="build")
+    depends_on("py-cryptography@2.3:", type=("build", "run"))
+    depends_on("py-six@1.5.2:", type=("build", "run"))
